@@ -1,151 +1,218 @@
-# Tiny-LLM — Host a Small Language Model on a Free Render Instance
+# Tiny-LLM — Product Requirements Document
+
+## Ultra-Low Footprint Conversational API ("Micro-Chat")
 
 **Status:** Draft
 **Author:** Ayush
 **Date:** 30 Sep 2026
+**Supersedes:** the Python/llama-cpp-python draft. We moved to Rust — reasoning in §2.
 
 ---
 
-## 1. The Problem
+## 1. Executive Summary & Objective
 
-I want to be able to run a language model somewhere that costs nothing and doesn't need a GPU. The obvious first instinct is to reach for Hugging Face Transformers and a small PyTorch model, but that doesn't survive contact with a free hosting tier. Render's free instances give you 512 MB of RAM, one vCPU, and an ephemeral disk. Standard `torch` alone is 3 GB+ on disk and burns 150–200 MB of RAM before you even load weights. The moment you import it, the instance is effectively dead.
+Build an asynchronous chat API in Rust that runs inside a hard **200 MB RAM ceiling** on a single free-tier vCPU, with support for **10 simultaneous chat sessions**. Conversation context is offloaded to an ephemeral SQLite database rather than held in RAM, and memory is released the instant a user disconnects.
 
-So the real question isn't "which model do I want to run" — it's "what is the largest model I can run inside 200 MB of resident memory on a box that has half a gig to give." The answer turns out to be much bigger than I expected, as long as I give up PyTorch entirely.
+The whole point is the constraint. A free Render instance has 512 MB and one core. Everything below — the language, the inference engine, the model quantization, the context cap, the SQLite offload — is downstream of that one number.
 
-## 2. Goals
+---
 
-- Run a chat-capable LLM 24/7 on Render's free tier without paying.
-- Stay comfortably under 512 MB RAM so the instance doesn't get OOM-killed.
-- Keep install/build time short and disk usage modest.
-- Expose the model over HTTP so I can hit it from anywhere.
-- Survive cold starts: a spun-down instance should come back up and be usable again on its own.
+## 2. Why Rust Instead of Python
 
-## 3. Non-Goals
+The Python draft assumed `llama-cpp-python`. It fits in ~20 MB idle and would probably have shipped. But for a service whose entire value proposition is *not using memory carelessly*, Python is working against me the whole way:
 
-- High-quality or creative output. This is a demo, not a product.
-- Streaming tokens at high throughput. One vCPU is one oCPU or 0.1vCPU.
-- Fine-tuning, embeddings, or a vector store. Out of scope.
-- Multi-user anything. There is no auth, no accounts, no per-user state.
+| Concern | Python | Rust |
+|---|---|---|
+| Baseline interpreter cost | ~15–25 MB, plus whatever the interpreter has already fragmented the heap | Near zero — the binary is the process |
+| Release of conversation history | Refcounting + cyclic GC; freed "eventually," with fragmentation | Deterministic `Drop`, freed *exactly* at scope exit |
+| Peak RSS during a burst | Transient spikes from allocator arenas | No allocator churn; flat curve |
+| Concurrency model | GIL forces threads or multiprocess; a worker process means a second copy of the model | tokio async tasks on one thread; model shared by reference, never reloaded |
+| Binary/model on disk | ~50 MB wheels + interpreter + 350 MB GGUF | Single stripped binary + the same GGUF |
 
-## 4. The Key Insight
+The decisive point is the second row. Requirement 3.1 says memory must be released on disconnect — Python gives me "it'll get collected eventually, probably." Rust gives me "it is released, and the compiler enforces that the `Drop` impl runs." For a service that's going to be judged on an RSS ceiling, deterministic is the whole game.
 
-Not using PyTorch is the whole trick. `llama-cpp-python` is a thin, C++-backed binding to `llama.cpp`, the inference engine that runs quantized GGUF models. It has no autograd, no CUDA runtime, no deep-learning framework tax. It imports in well under 30 MB of RAM and the wheel is a fraction of torch's size.
+Python also loads the model once per worker process. Two workers means two copies of 135M–500M parameters and an immediate OOM. Rust's single-threaded async queue sidesteps that: one model instance, many coroutines, no copies.
 
-That single decision is what makes the whole project fit. Everything else is just picking a model small enough to be polite about.
+**Cost of the switch:** compile times on Render's build step (mitigated by a multi-stage Docker build that compiles on a fat image and ships a slim runtime), and a smaller talent pool if this ever needs maintaining. Both are acceptable.
 
-## 5. How the Options Stack Up
+---
 
-I looked at three ways to get a model running on Render:
+## 3. Model Candidates & Memory Footprints
 
-| Approach | Disk | Idle RAM | Pulls from HF/URL? |
-|---|---|---|---|
-| `llama-cpp-python` | ~50 MB | ~20 MB | Yes, via `huggingface_hub` or a direct download |
-| `onnxruntime` + numpy | ~100 MB | ~35 MB | Yes, but you write the download code yourself |
-| `transformers` + torch | 3.5 GB+ ❌ | ~200 MB ❌ | Yes, by default |
+This is the decision that actually determines whether the project works. All figures below are **weights on disk** plus an **estimated resident RAM contribution** after load, at `n_ctx = 256`, `n_threads = 1`, on x86_64.
 
-The third column being "yes" for all three is a bit of a trap. Transformers and torch are disqualified on the first two columns alone, so the real choice is llama.cpp vs. ONNX Runtime. I'll go with `llama-cpp-python`: smaller footprint, a much better model ecosystem in GGUF, and quantizations down to Q2 that I simply can't get anywhere else.
+| Model | Params | Quant | File on disk | Resident contribution | Verdict |
+|---|---|---|---|---|---|
+| **SmolLM2-135M-Instruct** | 135M | Q4_K_M | **~100 MB** | **~110–125 MB** | ✅ **Proposed default.** Safest margin; leaves ~75 MB for everything else |
+| **SmolLM2-135M-Instruct** | 135M | Q8_0 | ~145 MB | ~155–170 MB | ⚠️ Tight. Only if 135M Q4 quality is unusable |
+| **Qwen2.5-0.5B-Instruct** | 494M | Q2_K | ~350 MB | ~380–410 MB | ❌ **Over budget on a 200 MB ceiling.** Good model, wrong tier |
+| **Qwen2.5-1.5B-Instruct** | 1.5B | Q2_K | ~350 MB¹ | ~900 MB–1.2 GB | ❌ Far over budget. Disqualified |
+| **Qwen2.5-0.5B-Instruct** | 494M | Q4_K_M | ~380 MB | ~410–440 MB | ❌ Over budget |
 
-**Dependencies (the entire list):**
+¹ The 1.5B Q2_K file is *smaller on disk* than the 0.5B Q4_K_M file — quantization gain beats the extra parameters — but it still lands far above the RAM ceiling once the KV cache and runtime overhead are counted. **Disk size was never the real constraint; resident size is.** That was the key correction from the Python draft.
 
-```
-huggingface_hub
-llama-cpp-python
-```
+### Decision
 
-Under 70 MB of disk combined. That's the whole dependency list, which is a nice thing to be able to say out loud.
+**Primary: `SmolLM2-135M-Instruct` at `Q4_K_M`, from `HuggingFaceTB/SmolLM2-135M-Instruct-GGUF`, file `smollm2-135m-instruct-q4_k_m.gguf`.**
 
-## 6. Model Choice
+Rationale:
+- ~100 MB on disk, ~110–125 MB resident. This is the only candidate that leaves real headroom under 200 MB.
+- It is instruction-tuned, so it holds a chat format without prompt gymnastics.
+- Q4_K_M is a genuinely good quantization — noticeably better than the Q2/Q3 that make bigger models "fit." At 135M, a good 4-bit beats a bad 2-bit.
+- Its quality ceiling is low. This is a demo, not a product. If 135M proves too weak, the honest next step is a 360M Q4_K_M (~250 MB) on a raised budget — **not** a jump to 0.5B, which does not fit at any quantization above Q2.
 
-**`Qwen/Qwen2.5-1.5B-Instruct-GGUF`, quantized to `q2_k`.**
+The model path is a single constant in one config module, so swapping is a one-line change.
 
-- It's instruction-tuned, so it can follow a chat prompt without heavy prompt engineering.
-- 1.5B parameters is small but, at Q2_K, the file is roughly **350 MB** — comfortably within Render's disk budget.
-- Q2 is aggressive. It hurts coherence and it definitely hurts at code. But at n_ctx=128 nobody's grading the output quality, and the memory savings are what make the thing possible.
-- Alternative if quality matters more than RAM later: swap to Q4_K_M (still under a gig, still fine) or move to a 0.5B model. Keep the model ID in one config constant so this is a one-line change.
+---
 
-## 7. Memory Strategy
+## 4. Core Architectural & System Constraints
 
-This is where the actual engineering is. Four levers, in rough order of impact:
+To prevent OOM kills on Render:
 
-1. **Context window — `n_ctx=128`.** This is the biggest one. KV cache memory scales linearly with context length. Dropping from 2048 to 128 removes the majority of the model's memory overhead. 128 tokens is enough for a "hello, how are you" demo and nothing more.
-2. **Quantization — Q2_K.** Rough 4-bit-ish compression of weights. The difference between Q2 and Q8 in file size is enormous.
-3. **Threads — `n_threads=1`.** Matches the single vCPU Render gives us. More threads would just contend for one core and add memory for no gain.
-4. **Verbose off.** Suppresses the log allocation and the startup noise. Small, but free.
+| Constraint | Value |
+|---|---|
+| Total system memory ceiling | **200 MB** |
+| Target baseline (idle, model loaded) | **< 150 MB** — leaving ~50 MB for live KV cache and OS operations |
+| Language / runtime | **Rust**, release binary, no heavy runtime |
+| Inference engine | **`llama-cpp-2`** — native C++ `llama.cpp` behind safe Rust bindings |
+| Model | **SmolLM2-135M-Instruct, Q4_K_M GGUF** |
+| Context window | **256 tokens**, hard cap in LLM config |
+| Concurrency strategy | Single-threaded token generation (`n_threads = 1`) with an async FIFO request queue on tokio |
 
-Target: **under 200 MB resident**, leaving headroom against the 512 MB ceiling for the interpreter, HTTP server, and the download buffer.
-
-## 8. The Download Problem
-
-`hf_hub_download` fetches a single `.gguf` file from a Hub repo without cloning it. That matters — a naive `git clone` of the model repo would pull every quantization variant and blow the disk budget on files I never load.
-
-```python
-from huggingface_hub import hf_hub_download
-
-model_path = hf_hub_download(
-    repo_id="Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-    filename="qwen2.5-1.5b-instruct-q2_k.gguf",
-)
-```
-
-The catch: **Render's disk is ephemeral.** When the instance spins down, that 350 MB file is gone, and the next cold start re-downloads it. That's a 30–60 second tax on every first request after a spin-down, which is fine for a demo and miserable if I ever care about latency.
-
-If that becomes annoying, the fix is to host the GGUF somewhere stable — a GitHub Release asset, or a direct Google Drive / Dropbox link — and swap `hf_hub_download` for a small `urllib` streaming download with a byte-range resume check. Same on-disk result, no cold-start re-download. **Not doing this in v1; noting it as the escape hatch.**
-
-## 9. HTTP Layer
-
-Flask over FastAPI: Flask pulls in less, and this is one endpoint.
+### Memory Budget (working numbers)
 
 ```
-POST /chat
-{ "prompt": "Hello, how are you?" }
-
-200 OK
-{ "response": "I'm doing well, thanks for asking!" }
+llama.cpp / backend runtime        ~ 15 MB
+GGUF weights (SmolLM2-135M Q4_K_M) ~115 MB
+KV cache @ n_ctx=256               ~  8 MB
+Tokio / axum / SQLite runtime      ~ 10 MB
+10 session buffers + HTTP state    ~  5 MB
+                                 --------
+Total                              ~153 MB   (ceiling: 200 MB)
 ```
 
-Also want:
-- `GET /health` — returns 200 with model-loaded status, so Render doesn't health-check-fail during the model download window.
-- Model load happens once at process start, not per request. Reloading a GGUF per request would be catastrophically slow.
+These are estimates until measured. §9 requires the real numbers and a correction to this table.
 
-## 10. Deployment
+---
 
-- **Build:** pip install the two requirements, `llama-cpp-python` has pre-built wheels so there's no long compile.
-- **Start:** `gunicorn --workers 1 --threads 1 app:app`. One worker, one thread — more would each try to load their own copy of the model into RAM and blow the limit instantly.
-- **Region:** pick the region closest to wherever the model file is hosted.
-- **Cold start budget:** download + load could be 60–90 seconds on a free instance. Set generous health-check grace and keep the instance warm during demos.
+## 5. Functional Requirements
 
-## 11. Risks and Known Problems
+### 5.1 Session & Connection Management
+- Accept connections via **WebSockets** (primary) and long-polling HTTP streams (fallback).
+- Generate a unique `session_id` on connect (UUIDv4).
+- **On disconnect, memory must be reclaimed deterministically.** The `Drop` impl for the session state releases every owned `String` immediately — no reliance on GC, no deferred cleanup.
+
+### 5.2 Context & History Offloading (SQLite)
+- Conversation history **must not** live in RAM as `Vec<String>`.
+- Single-file or `:memory:` SQLite via `rusqlite` (sync, simpler, and the queries here are trivial).
+- **Retain only the last 3 turns (6 messages) per session** to strictly bound token length.
+- Delete all rows for a `session_id` on disconnect.
+
+### 5.3 Inference Queue
+- Never allow 10 concurrent generations — that would spike RAM immediately.
+- FIFO async channel via `tokio::sync::mpsc`. All 10 clients may connect; prompts queue and are served sequentially. At <500M params on one core, a turn completes in a fraction of a second, so perceived latency stays acceptable.
+- One model instance, loaded once, shared behind `Arc`. Never reloaded, never cloned per task.
+
+### 5.4 Endpoints
+```
+WS   /ws/chat                      -- bidirectional chat
+POST /chat                         -- single-shot HTTP fallback
+GET  /health                       -- 200 with model-loaded status
+```
+
+---
+
+## 6. Database Schema
+
+```sql
+CREATE TABLE IF NOT EXISTS chat_history (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL,          -- 'user' or 'assistant'
+    content TEXT NOT NULL,       -- the text message
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_session ON chat_history(session_id);
+```
+
+---
+
+## 7. Non-Functional Requirements & Optimizations
+
+- **Build profile:** `--release`, `opt-level = 3`, `lto = true`, `codegen-units = 1`, `panic = "abort"`, and `strip = true` to keep the shipped binary small.
+- **Context window:** `n_ctx = 256` hard cap. This bounds KV cache growth directly — the dominant controllable memory variable after weights.
+- **Threads:** `n_threads = 1`. One vCPU; more threads contend and add memory for zero throughput.
+- **No GC.** Deterministic drop semantics mean the RSS curve stays flat instead of sawtoothing.
+- **Model download at startup:** `hf_hub_download` fetches only the single `.gguf` file — never clone the repo, which would pull every quantization variant. If startup is too slow, swap for a streaming download from a fixed URL.
+
+---
+
+## 8. Production Deployment Plan (Render Free Tier)
+
+### 8.1 Containerization
+Multi-stage `Dockerfile`:
+- **Stage 1** — full Rust image, builds the release binary with LTO.
+- **Stage 2** — `debian:stable-slim`, copies only the stripped binary and the `.gguf`. A Rust build needs no runtime, so the final image is roughly the model's size and nothing else.
+
+### 8.2 Environment Variables
+```
+MODEL_PATH=./models/smollm2-135m-instruct-q4_k_m.gguf
+MAX_CONCURRENT_SESSIONS=10
+CONTEXT_SIZE=256
+```
+
+### 8.3 Runtime Notes
+- **Ephemeral disk:** Render deletes the disk on spin-down. The ~100 MB model re-downloads on every cold start — tolerable at this size, and I can host the GGUF on a GitHub Release and stream it if it isn't.
+- **Health checks:** give generous startup grace; the instance is not ready until the model finishes loading.
+- **Build time:** LTO + `codegen-units = 1` makes for a slow build. Budget for it in the Render build step; it's a one-time cost per deploy.
+
+---
+
+## 9. Risks & Known Problems
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| 350 MB model re-downloads on every spin-down | Slow cold starts | Host on a GitHub Release and stream instead (deferred) |
-| `llama-cpp-python` has no prebuilt wheel for the platform | Build failures | Pin version, or build from source in the Render build step |
-| Actual RAM exceeds my 200 MB estimate | OOM kill | Measure it in production; drop `n_ctx` further or switch to a 0.5B model |
-| Q2 quality is noticeably bad | Poor demo | Acceptable for v1; Q4_K_M is the upgrade path |
-| Free tier sleeps after inactivity | Latency | Wake it manually before demos |
-| Someone finds the endpoint and runs up the bill | — | Free tier can't overcharge; no card on file means worst case is suspension |
-
-## 12. Rough Build Order
-
-1. Prove the model loads and generates inside the RAM budget, in a bare script. No server yet. If this fails, everything else is pointless.
-2. Wrap it in Flask with `/chat` and `/health`.
-3. Deploy to Render, measure real resident memory and real cold-start time.
-4. Write down the actual numbers and correct the estimates in this doc.
-
-## 13. Open Questions
-
-- Exact `n_ctx` floor where quality collapses — worth a sweep of 64 / 128 / 256.
-- Whether Render's free disk limit has room for a Q4 model instead (~1 GB).
-- Whether to add a streaming (`text/event-stream`) response. Nice, but Q2 output on one core is not fast, so the stream would be trickling.
-- Do I even need `huggingface_hub` as a dependency, or should I just stream from a fixed URL and drop one package?
+| Resident RAM exceeds the 150 MB estimate | OOM kill under 200 MB | Measure in production; drop `n_ctx` or move to a smaller quant |
+| 135M output quality is poor | Weak demo | Upgrade path is 360M Q4_K_M (~250 MB) on a raised budget — **not** 0.5B |
+| Queue latency spikes at 10 sessions | Users wait | Acceptable at this model size; bound the queue and return 429 past depth N |
+| SQLite file grows on disk | Disk pressure | Last-3-turns retention + purge on disconnect bounds it; consider `:memory:` |
+| LTO build exceeds Render's build timeout | Failed deploy | Raise `opt-level`/`lto` tuning, or build outside and ship the binary |
+| Model re-downloads on every spin-down | Slow cold starts | Host the GGUF on a GitHub Release and stream it |
+| Model unavailable at boot (HF down) | Total outage | Bake the model into the Docker image as a fallback |
+| Single-threaded generation | Throughput ceiling | Accepted by design; no GPU on free tier |
 
 ---
 
-## 14. Definition of Done
+## 10. Build Order
 
-- [ ] Model loads from Hugging Face on a cold start and generates a coherent-enough response
-- [ ] Peak RSS under 200 MB, verified in production
-- [ ] `POST /chat` and `GET /health` both responding
-- [ ] Deployed and publicly reachable at a Render URL
-- [ ] Cold-start time measured and written down
-- [ ] Total disk usage under 1 GB
+1. **Prove the memory claim first.** Bare Rust binary, load SmolLM2-135M Q4_K_M, generate a response, print RSS. No server, no database, no WebSockets. If 135M/Q4_K_M doesn't fit under 150 MB, everything downstream is wasted work and the model decision has to change.
+2. Wrap it in axum with `/chat` and `/health`.
+3. Add SQLite offloading + last-3-turns trimming.
+4. Add WebSockets and session lifecycle with `Drop`-based cleanup.
+5. Add the FIFO inference queue and 10-session cap.
+6. Multi-stage Dockerfile, deploy to Render.
+7. Measure real peak RSS and cold-start time; **correct the §4 budget table with actuals.**
+
+---
+
+## 11. Open Questions
+
+- What is the real RSS delta between Q4_K_M and Q8_0 for 135M? If it's small, Q8_0 might be worth taking.
+- Does SmolLM2-135M hold multi-turn coherence well enough at 256 tokens, or does the last-3-turns policy need to shrink to 2?
+- Should history live in `:memory:` SQLite (dies with the process, zero disk I/O) or a file (survives restart, but it's ephemeral on Render anyway)? `:memory:` looks like the right call — persistence on Render is illusory regardless.
+- Is `llama-cpp-2`'s prebuilt binary good enough, or do I need to build `llama.cpp` from source for reproducible memory behavior?
+- What's the queue-depth limit before returning 429 instead of accepting and hanging?
+- Is WebSocket-only enough, or does the long-polling fallback earn its keep?
+
+---
+
+## 12. Definition of Done
+
+- [ ] SmolLM2-135M Q4_K_M loads and generates within a **200 MB** ceiling, measured in production
+- [ ] Idle baseline under **150 MB** with model loaded
+- [ ] 10 concurrent WebSocket sessions served via FIFO queue, none rejected
+- [ ] History lives in SQLite, never in a `Vec<String>`
+- [ ] Disconnect purges DB rows and drops memory deterministically (verified via RSS drop)
+- [ ] Container image contains only the stripped binary + GGUF
+- [ ] Cold-start time measured and documented
+- [ ] §4 memory budget table updated with real numbers
