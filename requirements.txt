@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+llama-cpp-python==0.3.16
+gdown
+pydantic
