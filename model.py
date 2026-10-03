@@ -1,13 +1,31 @@
 import os
 import gc
 import time
+import re
+from dotenv import load_dotenv
+
+load_dotenv()
 
 MODEL_DIR = "models"
-MODEL_FILENAME = "qwen2.5-0.5b-instruct-q2_k.gguf"
+MODEL_FILENAME = os.getenv("MODEL_FILENAME", "qwen1.5-0.5b-chat-q2_k.gguf")
 MODEL_PATH = os.path.join(MODEL_DIR, MODEL_FILENAME)
 
-FILE_ID = "1iwluL_LzkdMxx7VgUw3gaCxDectPCTo8"
-MIN_MODEL_SIZE_BYTES = 10 * 1024 * 1024
+MIN_MODEL_SIZE_BYTES = int(os.getenv("MIN_MODEL_SIZE_MB", "50")) * 1024 * 1024
+
+def extract_file_id(drive_url: str) -> str:
+    """Extract file ID from various Google Drive URL formats."""
+    patterns = [
+        r'/file/d/([a-zA-Z0-9_-]+)',
+        r'id=([a-zA-Z0-9_-]+)',
+        r'uc\?id=([a-zA-Z0-9_-]+)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, drive_url)
+        if match:
+            return match.group(1)
+    return drive_url
+
+FILE_ID = extract_file_id(os.getenv("MODEL_DRIVE_URL", "1QuremM9CEn1B--2k7Uz9O5n61ftsMo0u"))
 
 def _model_is_valid() -> bool:
     return os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > MIN_MODEL_SIZE_BYTES
@@ -54,11 +72,16 @@ def load_model():
     llm = Llama(
         model_path=MODEL_PATH,
         n_ctx=128,
-        n_batch=32,
+        n_batch=8,
         n_threads=1,
+        n_threads_batch=1,
         use_mlock=False,
         use_mmap=True,
         verbose=False,
         logits_all=False,
+        low_vram=True,
+        numa=False,
+        mul_mat_q=True,
+        offload_kqv=True,
     )
     return llm
