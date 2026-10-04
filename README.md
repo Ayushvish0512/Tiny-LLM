@@ -1,12 +1,16 @@
 # Tiny-LLM — Minimal SLM on Render Free Tier
 
-## Quick Start
+## Local Setup (venv only, no Docker)
 
 ```bash
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
 DOWNLOAD_MODEL=1 python -c "from model import load_model; load_model()"
-gunicorn --workers 1 --threads 1 main:app
+uvicorn main:app --host 0.0.0.0 --port 8000 --timeout-keep-alive 120
 ```
+
+Check it: `curl http://localhost:8000/health`
 
 ## Endpoints
 
