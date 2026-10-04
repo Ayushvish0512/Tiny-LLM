@@ -30,9 +30,22 @@ FILE_ID = extract_file_id(os.getenv("MODEL_DRIVE_URL", "1QuremM9CEn1B--2k7Uz9O5n
 def _model_is_valid() -> bool:
     return os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > MIN_MODEL_SIZE_BYTES
 
+def model_status() -> str:
+    if not os.path.exists(MODEL_PATH):
+        return "missing"
+    if not _model_is_valid():
+        return f"corrupt: {os.path.getsize(MODEL_PATH)} bytes, need > {MIN_MODEL_SIZE_BYTES}"
+    return "available"
+
 def download_model(max_retries: int = 5, retry_sleep_s: int = 10) -> None:
-    if _model_is_valid():
+    status = model_status()
+    if status == "available":
+        print(f"Model already available at {MODEL_PATH}, skipping download.")
         return
+    if status == "missing":
+        print(f"No model file at {MODEL_PATH}, downloading.")
+    else:
+        print(f"Existing model file unusable ({status}), re-downloading.")
 
     os.makedirs(MODEL_DIR, exist_ok=True)
     if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) <= MIN_MODEL_SIZE_BYTES:
@@ -62,6 +75,10 @@ def download_model(max_retries: int = 5, retry_sleep_s: int = 10) -> None:
             if attempt < max_retries:
                 time.sleep(retry_sleep_s)
     raise RuntimeError(f"Download failed after {max_retries} attempts")
+
+if __name__ == "__main__":
+    download_model()
+    print(f"Model status: {model_status()}")
 
 def load_model():
     download_model()

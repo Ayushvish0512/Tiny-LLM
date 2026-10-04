@@ -6,13 +6,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import AsyncGenerator
 
-from model import load_model
+from model import load_model, model_status
 from generate import build_prompt, clean_chunk
 
 state = {}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    state["file"] = model_status()
     try:
         state["llm"] = load_model()
         state["status"] = "loaded"
@@ -38,7 +39,7 @@ class ChatRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "running", "model": state.get("status", "loading")}
+    return {"status": "running", "model": state.get("status", "loading"), "file": state.get("file", "unknown")}
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
