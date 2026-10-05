@@ -88,7 +88,7 @@ def load_model():
 
     llm = Llama(
         model_path=MODEL_PATH,
-        n_ctx=128,
+        n_ctx=512,
         n_batch=8,
         n_threads=1,
         n_threads_batch=1,

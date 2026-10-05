@@ -1,7 +1,7 @@
-fastapi
-uvicorn
-gunicorn
+fastapi==0.142.2
+uvicorn==0.54.0
+gunicorn==26.2.0
 llama-cpp-python==0.3.21
-gdown
-pydantic
-python-dotenv
+gdown==6.4.1
+pydantic==2.13.5
+python-dotenv==1.2.4

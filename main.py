@@ -16,6 +16,7 @@ async def lifespan(app: FastAPI):
     state["file"] = model_status()
     try:
         state["llm"] = load_model()
+        state["file"] = model_status()
         state["status"] = "loaded"
     except Exception as e:
         state["llm"] = None
@@ -36,6 +37,12 @@ app.add_middleware(
 class ChatRequest(BaseModel):
     prompt: str = Field(..., max_length=500)
     max_tokens: int = Field(64, ge=1, le=256)
+
+
+@app.get("/")
+def root():
+    return health()
+
 
 @app.get("/health")
 def health():
