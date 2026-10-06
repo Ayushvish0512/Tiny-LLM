@@ -1,0 +1,9 @@
+.git
+.kilo
+.venv
+venv
+models
+.env
+__pycache__
+*.py[cod]
+*.md

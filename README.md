@@ -92,3 +92,49 @@ which is why the start command above invokes `uvicorn` directly.
 
 Note that `.venv/` and `models/` are gitignored and can be cleared between
 sessions; recreate the venv and re-run `model.py` if either goes missing.
+## Docker deploy (no compile on Render)
+
+The `Dockerfile` compiles llama.cpp once at build time and bakes the
+298 MB model into the image, so deploys never compile and container
+starts are instant with no Google Drive dependency.
+
+```
+docker build -t tiny-llm .
+docker tag tiny-llm docker.io/<user>/tiny-llm:latest
+docker push docker.io/<user>/tiny-llm:latest
+```
+
+Then create a **Docker Web Service** on Render from that image.
+
+Notes:
+
+- Docker Web Services on Render are not free tier; you pay for the
+  instance.
+- The image is ~1.2 GB because the model is baked in, and it is
+  re-pulled on every deploy.
+- The `CMD` binds `0.0.0.0:$PORT`, which is what Render requires -
+  a hardcoded port makes the container unreachable.
+- Local run: `docker run --rm -p 8000:8000 tiny-llm`, then
+  `curl http://localhost:8000/health`.
+## Troubleshooting
+
+**Every request returns 500 with `FastAPI.__call__() missing 1 required positional argument: 'send'`**
+
+The Start Command in the Render dashboard overrides `Procfile`. A plain
+`gunicorn ... main:app` uses gunicorn's default **sync** worker, which is a WSGI
+worker and calls the app as `self.wsgi(environ, resp.start_response)` - two
+arguments. `FastAPI.__call__` is ASGI and needs three (`scope, receive, send`),
+so every request raises `TypeError`. Either delete the dashboard Start Command so
+the `Procfile` is used, or add the worker class:
+
+```
+gunicorn --worker-class uvicorn.workers.UvicornWorker --workers 1 --timeout 120 --bind 0.0.0.0:$PORT main:app
+```
+
+**Build stalls on `Building wheel for llama-cpp-python`, or dies with an OOM**
+
+Two causes. Check the interpreter path in the log first: if it shows `python3.14`,
+`runtime.txt` was ignored, and the C++ sdist is being compiled against a new C
+API. Set `PYTHON_VERSION=3.11.9` in the dashboard and keep `.python-version`
+committed. Then apply the `CMAKE_ARGS` block above to cut the compile down to a
+single x86 variant.
