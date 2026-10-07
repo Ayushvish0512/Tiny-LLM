@@ -93,7 +93,10 @@ def load_model():
         n_threads=1,
         n_threads_batch=1,
         use_mlock=False,
-        use_mmap=True,
+        # Full model resident (~280 MB) stays within the 350 MB budget and
+        # removes mmap page-fault stalls. CPU is already saturated on the
+        # shared vCPU, so n_threads stays 1 (more threads only thrash it).
+        use_mmap=False,
         verbose=False,
         logits_all=False,
         low_vram=True,
